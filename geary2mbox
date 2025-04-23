@@ -1,0 +1,1059 @@
+#!/usr/bin/env python3
+"""
+geary2mbox - Convert Geary email database to mbox format
+
+This script extracts emails from Geary's SQLite database and converts them
+to standard mbox format. Optionally imports directly to Claws Mail.
+"""
+
+import os
+import sys
+import re
+import argparse
+import sqlite3
+import shutil
+import email.utils
+from datetime import datetime
+from email.message import EmailMessage
+
+# ANSI color codes and formatting
+BOLD = "\033[1m"
+ITALIC = "\033[3m"
+UNDERLINE = "\033[4m"
+GREEN = "\033[32m"
+BRIGHT_GREEN = "\033[92m"
+YELLOW = "\033[33m"
+BRIGHT_YELLOW = "\033[93m"
+BLUE = "\033[34m"
+BRIGHT_BLUE = "\033[94m"
+MAGENTA = "\033[35m"
+BRIGHT_MAGENTA = "\033[95m"
+CYAN = "\033[36m"
+BRIGHT_CYAN = "\033[96m"
+RED = "\033[31m"
+BRIGHT_RED = "\033[91m"
+RESET = "\033[0m"
+
+# Set global quiet mode flag
+QUIET_MODE = False
+# Default indentation
+INDENT = "  "
+
+def print_header(message, char="━", color=BRIGHT_CYAN):
+    """Print a styled header"""
+    if not QUIET_MODE:
+        width = min(40, len(message) + 4)
+        border = char * width
+        print(f"\n{color}{border}")
+        print(f"{BOLD}{message}{RESET}")
+        print(f"{color}{border}{RESET}\n")
+
+def print_subheader(message, color=CYAN):
+    """Print a styled subheader"""
+    if not QUIET_MODE:
+        print(f"\n{color}{BOLD}{message}{RESET}\n")
+
+def print_info(message):
+    """Print an info message with icon"""
+    if not QUIET_MODE:
+        print(f"{BRIGHT_BLUE}ℹ {RESET}{message}")
+
+def print_detail(message, level=1):
+    """Print a detail message with indentation"""
+    if not QUIET_MODE:
+        indent = INDENT * level
+        print(f"{indent}{BRIGHT_BLUE}▸ {RESET}{message}")
+
+def print_error(message):
+    """Print an error message with icon"""
+    print(f"{BRIGHT_RED}✘ {BOLD}Error:{RESET} {message}", file=sys.stderr)
+
+def print_warning(message):
+    """Print a warning message with icon"""
+    print(f"{BRIGHT_YELLOW}⚠ {BOLD}Warning:{RESET} {message}")
+
+def print_success(message):
+    """Print a success message with icon"""
+    print(f"{BRIGHT_GREEN}✓ {RESET}{message}")
+
+def print_progress(current, total, prefix="Progress", suffix="Complete", length=30):
+    """Print a progress bar"""
+    if QUIET_MODE or total == 0:
+        return
+    
+    filled_length = int(length * current // total)
+    bar = f"{BRIGHT_GREEN}{'█' * filled_length}{BRIGHT_BLUE}{'░' * (length - filled_length)}{RESET}"
+    percent = f"{BRIGHT_YELLOW}{100 * current / total:.1f}%{RESET}"
+    
+    print(f"\r{prefix} |{bar}| {percent} {suffix} ({current}/{total})", end="")
+    
+    if current == total:
+        print()
+
+def format_date(timestamp=None):
+    """Format date for mbox"""
+    if timestamp:
+        try:
+            date = datetime.fromtimestamp(timestamp)
+            return date.strftime("%a %b %d %H:%M:%S %Y")
+        except:
+            pass
+    return email.utils.formatdate()
+
+def sanitize_filename(name):
+    """Create safe filename"""
+    if not name:
+        return "unnamed"
+    return re.sub(r'[^\w\-\.]', '_', name)
+
+def extract_email(addr):
+    """Extract email from address"""
+    if not addr:
+        return "unknown@unknown"
+    if isinstance(addr, bytes):
+        addr = addr.decode('utf-8', errors='replace')
+    match = re.search(r'[\w.+-]+@[\w.-]+', addr)
+    if match:
+        return match.group(0)
+    return addr
+
+def process_folder(cursor, folder_id, folder_name, output_path, attachments_dir):
+    """Process a folder and convert emails to mbox format"""
+    print_subheader(f"Processing folder: {BRIGHT_MAGENTA}{folder_name}{RESET}")
+    
+    try:
+        # Create output file and get messages
+        with open(output_path, 'w', encoding='utf-8', errors='replace') as outfile:
+            # Get message IDs
+            cursor.execute("""
+                SELECT m.id
+                FROM MessageTable m 
+                JOIN MessageLocationTable ml ON m.id = ml.message_id 
+                WHERE ml.folder_id = ?
+                ORDER BY m.date_time_t
+            """, (folder_id,))
+            messages = cursor.fetchall()
+            
+            if not messages:
+                print_warning(f"No messages found in folder: {folder_name}")
+                return 0
+            
+            total_messages = len(messages)
+            print_info(f"Found {BRIGHT_YELLOW}{total_messages}{RESET} messages to process")
+            
+            # Process each message
+            count = 0
+            for i, (msg_id,) in enumerate(messages):
+                # Update progress periodically
+                if i % 10 == 0 or i == total_messages - 1:
+                    print_progress(i, total_messages, prefix=f"Converting {folder_name}", suffix="")
+                
+                # Get message data (with text factory to handle binary data)
+                old_factory = cursor.connection.text_factory
+                cursor.connection.text_factory = lambda x: x
+                
+                cursor.execute("""
+                    SELECT from_field, date_time_t, subject, header, body
+                    FROM MessageTable 
+                    WHERE id = ?
+                """, (msg_id,))
+                row = cursor.fetchone()
+                
+                # Also fetch any attachments
+                cursor.execute("""
+                    SELECT filename, mime_type
+                    FROM MessageAttachmentTable
+                    WHERE message_id = ? AND filename IS NOT NULL
+                """, (msg_id,))
+                attachments = cursor.fetchall()
+                
+                # Restore text factory
+                cursor.connection.text_factory = old_factory
+                
+                if not row:
+                    continue
+                
+                # Extract data
+                from_field, date, subject, header, body = row
+                
+                # Create mbox separator (From line)
+                try:
+                    email_addr = extract_email(from_field)
+                    mbox_date = format_date(date)
+                    separator = f"From {email_addr} {mbox_date}"
+                    outfile.write(separator + '\n')
+                    
+                    # Process based on whether we have attachments
+                    if attachments:
+                        # We have attachments - need to create a MIME message
+                        from email.mime.multipart import MIMEMultipart
+                        from email.mime.text import MIMEText
+                        from email.mime.base import MIMEBase
+                        from email import encoders
+                        import base64
+                        
+                        # Create the message
+                        mime_msg = MIMEMultipart()
+                        
+                        # If original header has MIME structure, try to preserve it
+                        preserve_mime = False
+                        if header and isinstance(header, bytes) and b'Content-Type: multipart' in header:
+                            try:
+                                # Try to preserve original MIME structure
+                                if body and isinstance(body, bytes):
+                                    full_message = header + b'\r\n\r\n' + body
+                                    # Just write the complete MIME message as is
+                                    full_text = full_message.decode('utf-8', errors='replace')
+                                    full_text = re.sub(r'^From ', '>From ', full_text, flags=re.MULTILINE)
+                                    outfile.write(full_text)
+                                    preserve_mime = True
+                            except Exception as e:
+                                print_error(f"Failed to preserve MIME: {e}, falling back to reconstruction")
+                        
+                        # If we didn't preserve MIME structure, reconstruct it
+                        if not preserve_mime:
+                            # Add headers from original message
+                            if header and isinstance(header, bytes):
+                                try:
+                                    header_text = header.decode('utf-8', errors='replace')
+                                    for line in header_text.split('\n'):
+                                        if ':' in line:
+                                            name, value = line.split(':', 1)
+                                            if name.strip().lower() not in ['content-type', 'mime-version', 'content-transfer-encoding']:
+                                                mime_msg[name.strip()] = value.strip()
+                                except Exception as e:
+                                    print_warning(f"Header parsing error: {e}")
+                                    # Add basic headers
+                                    mime_msg['From'] = email_addr
+                                    if subject and isinstance(subject, bytes):
+                                        mime_msg['Subject'] = subject.decode('utf-8', errors='replace')
+                                    else:
+                                        mime_msg['Subject'] = f"Message {msg_id}"
+                                    mime_msg['Date'] = mbox_date
+                                    mime_msg['Message-ID'] = f"<{msg_id}.geary@localhost>"
+                            else:
+                                # Add basic headers
+                                mime_msg['From'] = email_addr
+                                if subject and isinstance(subject, bytes):
+                                    mime_msg['Subject'] = subject.decode('utf-8', errors='replace')
+                                else:
+                                    mime_msg['Subject'] = f"Message {msg_id}"
+                                mime_msg['Date'] = mbox_date
+                                mime_msg['Message-ID'] = f"<{msg_id}.geary@localhost>"
+                                
+                            # Add body
+                            if body and isinstance(body, bytes):
+                                # Check if the body is HTML or text
+                                try:
+                                    body_text = body.decode('utf-8', errors='replace')
+                                    if body_text.strip().startswith('<'):
+                                        mime_msg.attach(MIMEText(body_text, 'html', 'utf-8'))
+                                    else:
+                                        mime_msg.attach(MIMEText(body_text, 'plain', 'utf-8'))
+                                except:
+                                    mime_msg.attach(MIMEText(f"[Error: Could not decode message {msg_id} body]"))
+                            else:
+                                mime_msg.attach(MIMEText(f"[No body for message {msg_id}]"))
+                                
+                            # Add attachments
+                            for att_filename, att_mime_type in attachments:
+                                if not att_filename:
+                                    continue
+                                    
+                                try:
+                                    if isinstance(att_filename, bytes):
+                                        att_filename = att_filename.decode('utf-8', errors='replace')
+                                        
+                                    if isinstance(att_mime_type, bytes):
+                                        att_mime_type = att_mime_type.decode('utf-8', errors='replace')
+                                    
+                                    # Try to find the attachment file
+                                    att_paths = [
+                                        os.path.join(attachments_dir, str(msg_id), str(len(att_filename) % 100), att_filename),
+                                        os.path.join(attachments_dir, str(msg_id), "1", att_filename),
+                                        os.path.join(attachments_dir, str(msg_id), "2", att_filename),
+                                        os.path.join(attachments_dir, str(msg_id), att_filename)
+                                    ]
+                                    
+                                    att_path = None
+                                    for path in att_paths:
+                                        if os.path.exists(path):
+                                            att_path = path
+                                            break
+                                    
+                                    if att_path:
+                                        # Read attachment and add to message
+                                        with open(att_path, 'rb') as att_file:
+                                            if not att_mime_type:
+                                                att_mime_type = 'application/octet-stream'
+                                                
+                                            maintype, subtype = att_mime_type.split('/', 1) if '/' in att_mime_type else ('application', 'octet-stream')
+                                            part = MIMEBase(maintype, subtype)
+                                            part.set_payload(att_file.read())
+                                            
+                                            encoders.encode_base64(part)
+                                            part.add_header('Content-Disposition', f'attachment; filename="{att_filename}"')
+                                            mime_msg.attach(part)
+                                except Exception as e:
+                                    print_warning(f"Error with attachment {att_filename} for message {msg_id}: {str(e)}")
+                                    # Continue with other attachments
+                            
+                            # Write the message to file
+                            message_text = mime_msg.as_string()
+                            message_text = re.sub(r'^From ', '>From ', message_text, flags=re.MULTILINE)
+                            outfile.write(message_text)
+                        
+                    else:
+                        # No attachments - simpler case
+                        # Write original headers if available
+                        if header and isinstance(header, bytes):
+                            try:
+                                outfile.write(header.decode('utf-8', errors='replace'))
+                                outfile.write('\n\n')
+                            except:
+                                # Fallback - create minimal headers
+                                if subject and isinstance(subject, bytes):
+                                    subject = subject.decode('utf-8', errors='replace')
+                                else:
+                                    subject = f"Message {msg_id}"
+                                    
+                                outfile.write(f"From: {email_addr}\n")
+                                outfile.write(f"Subject: {subject}\n")
+                                outfile.write(f"Date: {mbox_date}\n")
+                                outfile.write(f"Message-ID: <{msg_id}.geary@localhost>\n")
+                                outfile.write("\n")
+                        else:
+                            # Create minimal headers
+                            if subject and isinstance(subject, bytes):
+                                subject = subject.decode('utf-8', errors='replace')
+                            else:
+                                subject = f"Message {msg_id}"
+                                
+                            outfile.write(f"From: {email_addr}\n")
+                            outfile.write(f"Subject: {subject}\n")
+                            outfile.write(f"Date: {mbox_date}\n")
+                            outfile.write(f"Message-ID: <{msg_id}.geary@localhost>\n")
+                            outfile.write("\n")
+                            
+                        # Write body
+                        if body and isinstance(body, bytes):
+                            try:
+                                # Escape From lines to comply with mbox format
+                                text = body.decode('utf-8', errors='replace')
+                                text = re.sub(r'^From ', '>From ', text, flags=re.MULTILINE)
+                                outfile.write(text)
+                            except:
+                                outfile.write(f"[Error: Could not decode message {msg_id} body]")
+                        else:
+                            outfile.write(f"[No body for message {msg_id}]")
+                        
+                    # Ensure blank line after message
+                    outfile.write("\n\n")
+                    count += 1
+                                            
+                except Exception as e:
+                    print_error(f"Error with message {msg_id}: {str(e)}")
+                    continue
+            
+            # Final progress update
+            print_progress(total_messages, total_messages, prefix=f"Converting {folder_name}", suffix="")
+            print_success(f"Converted {BRIGHT_GREEN}{count}{RESET} messages from '{BRIGHT_MAGENTA}{folder_name}{RESET}' to {BRIGHT_CYAN}{os.path.basename(output_path)}{RESET}")
+            
+            return count
+            
+    except Exception as e:
+        print_error(f"Error processing folder {folder_name}: {str(e)}")
+        return 0
+
+def process_database(db_path, output_dir):
+    """Process a Geary database"""
+    account_name = os.path.basename(os.path.dirname(db_path))
+    print_subheader(f"Processing database: {YELLOW}{account_name}{RESET}")
+    
+    try:
+        # Connect to database
+        conn = sqlite3.connect(db_path, timeout=60.0)
+        cursor = conn.cursor()
+        
+        # Path to attachments directory
+        attachments_dir = os.path.join(os.path.dirname(db_path), "attachments")
+        print_info(f"Attachments directory: {BRIGHT_BLUE}{attachments_dir}{RESET}")
+        
+        # Get folders
+        cursor.execute("""
+            SELECT f.id, f.name, COUNT(ml.message_id) as count
+            FROM FolderTable f
+            LEFT JOIN MessageLocationTable ml ON f.id = ml.folder_id
+            GROUP BY f.id, f.name
+            HAVING count > 0
+            ORDER BY count DESC
+        """)
+        folders = cursor.fetchall()
+        
+        if not folders:
+            print_warning("No folders found with messages")
+            conn.close()
+            return 0, 0
+            
+        # Process each folder
+        total_folders = 0
+        total_messages = 0
+        
+        for folder_id, folder_name, count in folders:
+            if not folder_name:
+                folder_name = f"Folder_{folder_id}"
+                
+            # Create safe filename
+            safe_name = sanitize_filename(folder_name)
+            output_path = os.path.join(output_dir, f"{safe_name}.mbox")
+            
+            # Process folder
+            msgs = process_folder(cursor, folder_id, folder_name, output_path, attachments_dir)
+            
+            if msgs > 0:
+                total_folders += 1
+                total_messages += msgs
+                
+        conn.close()
+        
+        # Final status
+        return total_folders, total_messages
+        
+    except Exception as e:
+        print_error(f"Error processing database: {str(e)}")
+        return 0, 0
+
+def process_database_combined(db_path, output_dir, combined_path, processed_ids=None):
+    """Process a Geary database with all messages going to one combined mbox file
+       with deduplication of messages that have already been processed"""
+    account_name = os.path.basename(os.path.dirname(db_path))
+    print_subheader(f"Processing database: {YELLOW}{account_name}{RESET} (Combined Mode)")
+    
+    # Initialize deduplication tracking if not provided
+    if processed_ids is None:
+        processed_ids = set()
+    
+    try:
+        # Connect to database
+        conn = sqlite3.connect(db_path, timeout=60.0)
+        cursor = conn.cursor()
+        
+        # Path to attachments directory
+        attachments_dir = os.path.join(os.path.dirname(db_path), "attachments")
+        print_info(f"Account: {BRIGHT_YELLOW}{account_name}{RESET}")
+        print_info(f"Attachments directory: {BRIGHT_BLUE}{attachments_dir}{RESET}")
+        
+        # Get folders with message counts
+        cursor.execute("""
+            SELECT f.id, f.name, COUNT(ml.message_id) as count
+            FROM FolderTable f
+            LEFT JOIN MessageLocationTable ml ON f.id = ml.folder_id
+            GROUP BY f.id, f.name
+            HAVING count > 0
+            ORDER BY count DESC
+        """)
+        folders = cursor.fetchall()
+        
+        if not folders:
+            print_warning("No folders found with messages")
+            conn.close()
+            return 0, 0
+        
+        # Check if file exists to determine mode
+        file_exists = os.path.exists(combined_path) and os.path.getsize(combined_path) > 0
+        mode = 'a' if file_exists else 'w'
+        
+        # Open the combined output file
+        with open(combined_path, mode, encoding='utf-8', errors='replace') as outfile:
+            # Process each folder
+            total_folders = 0
+            total_messages = 0
+            skipped_messages = 0
+            
+            for folder_id, folder_name, count in folders:
+                if not folder_name:
+                    folder_name = f"Folder_{folder_id}"
+                
+                print_info(f"Processing folder: {BRIGHT_MAGENTA}{folder_name}{RESET} ({BRIGHT_YELLOW}{count}{RESET} messages)")
+                
+                # Get message IDs
+                cursor.execute("""
+                    SELECT m.id, m.message_id
+                    FROM MessageTable m 
+                    JOIN MessageLocationTable ml ON m.id = ml.message_id 
+                    WHERE ml.folder_id = ?
+                    ORDER BY m.date_time_t
+                """, (folder_id,))
+                messages = cursor.fetchall()
+                
+                if not messages:
+                    continue
+                
+                # Process each message
+                folder_count = 0
+                skipped_in_folder = 0
+                
+                total_in_folder = len(messages)
+                
+                for i, (msg_id, msg_message_id) in enumerate(messages):
+                    # Update progress periodically
+                    if i % 10 == 0 or i == total_in_folder - 1:
+                        print_progress(i, total_in_folder, prefix=f"Adding {folder_name}", suffix="")
+                        
+                    # Track message IDs for deduplication
+                    # If message_id is NULL, use the internal ID
+                    tracking_id = msg_message_id if msg_message_id else f"internal-{msg_id}"
+                    
+                    # Skip if already processed
+                    if tracking_id in processed_ids:
+                        skipped_messages += 1
+                        skipped_in_folder += 1
+                        continue
+                    
+                    # Get message data with binary handling
+                    old_factory = cursor.connection.text_factory
+                    cursor.connection.text_factory = lambda x: x
+                    
+                    cursor.execute("""
+                        SELECT from_field, date_time_t, subject, header, body
+                        FROM MessageTable 
+                        WHERE id = ?
+                    """, (msg_id,))
+                    row = cursor.fetchone()
+                    
+                    # Also fetch any attachments
+                    cursor.execute("""
+                        SELECT filename, mime_type
+                        FROM MessageAttachmentTable
+                        WHERE message_id = ? AND filename IS NOT NULL
+                    """, (msg_id,))
+                    attachments = cursor.fetchall()
+                    
+                    # Restore text factory
+                    cursor.connection.text_factory = old_factory
+                    
+                    if not row:
+                        continue
+                    
+                    # Extract data
+                    from_field, date, subject, header, body = row
+                    
+                    # Create mbox separator (From line)
+                    try:
+                        email_addr = extract_email(from_field)
+                        mbox_date = format_date(date)
+                        separator = f"From {email_addr} {mbox_date}"
+                        outfile.write(separator + '\n')
+                        
+                        # Process based on whether we have attachments
+                        if attachments:
+                            # We have attachments - need to create a MIME message
+                            from email.mime.multipart import MIMEMultipart
+                            from email.mime.text import MIMEText
+                            from email.mime.base import MIMEBase
+                            from email import encoders
+                            
+                            # If original header has MIME structure, try to preserve it
+                            preserve_mime = False
+                            if header and isinstance(header, bytes) and b'Content-Type: multipart' in header:
+                                try:
+                                    # Add custom folder header to original header
+                                    header_text = header.decode('utf-8', errors='replace')
+                                    # Add our custom folder info
+                                    header_lines = header_text.splitlines()
+                                    header_lines.insert(1, f"X-Geary-Folder: {account_name}/{folder_name}")
+                                    modified_header = "\r\n".join(header_lines) + "\r\n"
+                                    
+                                    # Try to preserve original MIME structure
+                                    if body and isinstance(body, bytes):
+                                        # Just write the modified message
+                                        full_text = modified_header + "\r\n" + body.decode('utf-8', errors='replace')
+                                        full_text = re.sub(r'^From ', '>From ', full_text, flags=re.MULTILINE)
+                                        outfile.write(full_text)
+                                        preserve_mime = True
+                                except Exception as e:
+                                    print_warning(f"Failed to preserve MIME: {e}, falling back")
+                            
+                            # If preservation failed, reconstruct the message
+                            if not preserve_mime:
+                                # Create a new MIME message
+                                mime_msg = MIMEMultipart()
+                                
+                                # Add headers from original message
+                                if header and isinstance(header, bytes):
+                                    try:
+                                        header_text = header.decode('utf-8', errors='replace')
+                                        for line in header_text.split('\n'):
+                                            if ':' in line:
+                                                name, value = line.split(':', 1)
+                                                if name.strip().lower() not in ['content-type', 'mime-version', 'content-transfer-encoding']:
+                                                    mime_msg[name.strip()] = value.strip()
+                                    except:
+                                        # Add basic headers
+                                        mime_msg['From'] = email_addr
+                                        if subject and isinstance(subject, bytes):
+                                            mime_msg['Subject'] = subject.decode('utf-8', errors='replace')
+                                        else:
+                                            mime_msg['Subject'] = f"Message {msg_id}"
+                                        mime_msg['Date'] = mbox_date
+                                        mime_msg['Message-ID'] = f"<{msg_id}.geary@localhost>"
+                                else:
+                                    # Add basic headers
+                                    mime_msg['From'] = email_addr
+                                    if subject and isinstance(subject, bytes):
+                                        mime_msg['Subject'] = subject.decode('utf-8', errors='replace')
+                                    else:
+                                        mime_msg['Subject'] = f"Message {msg_id}"
+                                    mime_msg['Date'] = mbox_date
+                                    mime_msg['Message-ID'] = f"<{msg_id}.geary@localhost>"
+                                
+                                # Add our folder info
+                                mime_msg['X-Geary-Folder'] = f"{account_name}/{folder_name}"
+                                
+                                # Add body
+                                if body and isinstance(body, bytes):
+                                    # Check if body is HTML or plain text
+                                    try:
+                                        body_text = body.decode('utf-8', errors='replace')
+                                        if body_text.strip().startswith('<'):
+                                            mime_msg.attach(MIMEText(body_text, 'html', 'utf-8'))
+                                        else:
+                                            mime_msg.attach(MIMEText(body_text, 'plain', 'utf-8'))
+                                    except:
+                                        mime_msg.attach(MIMEText(f"[Error: Could not decode message {msg_id} body]"))
+                                else:
+                                    mime_msg.attach(MIMEText(f"[No body for message {msg_id}]"))
+                                
+                                # Add attachments
+                                for att_filename, att_mime_type in attachments:
+                                    if not att_filename:
+                                        continue
+                                        
+                                    try:
+                                        if isinstance(att_filename, bytes):
+                                            att_filename = att_filename.decode('utf-8', errors='replace')
+                                            
+                                        if isinstance(att_mime_type, bytes):
+                                            att_mime_type = att_mime_type.decode('utf-8', errors='replace')
+                                        
+                                        # Try to find the attachment file
+                                        att_paths = [
+                                            os.path.join(attachments_dir, str(msg_id), str(len(att_filename) % 100), att_filename),
+                                            os.path.join(attachments_dir, str(msg_id), "1", att_filename),
+                                            os.path.join(attachments_dir, str(msg_id), "2", att_filename),
+                                            os.path.join(attachments_dir, str(msg_id), att_filename)
+                                        ]
+                                        
+                                        att_path = None
+                                        for path in att_paths:
+                                            if os.path.exists(path):
+                                                att_path = path
+                                                break
+                                        
+                                        if att_path:
+                                            # Read attachment and add to message
+                                            with open(att_path, 'rb') as att_file:
+                                                if not att_mime_type:
+                                                    att_mime_type = 'application/octet-stream'
+                                                    
+                                                maintype, subtype = att_mime_type.split('/', 1) if '/' in att_mime_type else ('application', 'octet-stream')
+                                                part = MIMEBase(maintype, subtype)
+                                                part.set_payload(att_file.read())
+                                                
+                                                encoders.encode_base64(part)
+                                                part.add_header('Content-Disposition', f'attachment; filename="{att_filename}"')
+                                                mime_msg.attach(part)
+                                    except Exception as e:
+                                        print_warning(f"Error with attachment {att_filename} for message {msg_id}: {str(e)}")
+                                
+                                # Write the message
+                                message_text = mime_msg.as_string()
+                                message_text = re.sub(r'^From ', '>From ', message_text, flags=re.MULTILINE)
+                                outfile.write(message_text)
+                        else:
+                            # No attachments - simpler handling
+                            # Write original headers if available
+                            if header and isinstance(header, bytes):
+                                try:
+                                    # Parse the header and add our folder info
+                                    header_text = header.decode('utf-8', errors='replace')
+                                    header_lines = header_text.splitlines()
+                                    header_lines.insert(1, f"X-Geary-Folder: {account_name}/{folder_name}")
+                                    outfile.write("\r\n".join(header_lines) + "\r\n\r\n")
+                                except:
+                                    # Fallback - create minimal headers
+                                    if subject and isinstance(subject, bytes):
+                                        subject = subject.decode('utf-8', errors='replace')
+                                    else:
+                                        subject = f"Message {msg_id}"
+                                        
+                                    outfile.write(f"From: {email_addr}\n")
+                                    outfile.write(f"Subject: {subject}\n")
+                                    outfile.write(f"Date: {mbox_date}\n")
+                                    outfile.write(f"Message-ID: <{msg_id}.geary@localhost>\n")
+                                    outfile.write(f"X-Geary-Folder: {account_name}/{folder_name}\n")
+                                    outfile.write("\n")
+                            else:
+                                # Create minimal headers
+                                if subject and isinstance(subject, bytes):
+                                    subject = subject.decode('utf-8', errors='replace')
+                                else:
+                                    subject = f"Message {msg_id}"
+                                    
+                                outfile.write(f"From: {email_addr}\n")
+                                outfile.write(f"Subject: {subject}\n")
+                                outfile.write(f"Date: {mbox_date}\n")
+                                outfile.write(f"Message-ID: <{msg_id}.geary@localhost>\n")
+                                outfile.write(f"X-Geary-Folder: {account_name}/{folder_name}\n")
+                                outfile.write("\n")
+                                
+                            # Write body
+                            if body and isinstance(body, bytes):
+                                try:
+                                    # Escape From lines to comply with mbox format
+                                    text = body.decode('utf-8', errors='replace')
+                                    text = re.sub(r'^From ', '>From ', text, flags=re.MULTILINE)
+                                    outfile.write(text)
+                                except:
+                                    outfile.write(f"[Error: Could not decode message {msg_id} body]")
+                            else:
+                                outfile.write(f"[No body for message {msg_id}]")
+                            
+                        # Ensure blank line after message
+                        outfile.write("\n\n")
+                        folder_count += 1
+                        
+                        # Mark as processed for deduplication
+                        processed_ids.add(tracking_id)
+                                                
+                    except Exception as e:
+                        print_error(f"Error with message {msg_id}: {str(e)}")
+                        continue
+                
+                # Final progress update for folder
+                print_progress(total_in_folder, total_in_folder, prefix=f"Adding {folder_name}", suffix="")
+                
+                # Update stats
+                if folder_count > 0:
+                    total_folders += 1
+                    total_messages += folder_count
+                    print_success(f"Added {BRIGHT_GREEN}{folder_count}{RESET} messages from '{BRIGHT_MAGENTA}{folder_name}{RESET}'")
+                    if skipped_in_folder > 0:
+                        print_detail(f"Skipped {BRIGHT_YELLOW}{skipped_in_folder}{RESET} duplicate messages in this folder")
+        
+        # Final status
+        print_success(f"Added {BRIGHT_GREEN}{total_messages}{RESET} messages from {BRIGHT_YELLOW}{total_folders}{RESET} folders to {BRIGHT_CYAN}{os.path.basename(combined_path)}{RESET}")
+        if skipped_messages > 0:
+            print_info(f"Skipped {BRIGHT_YELLOW}{skipped_messages}{RESET} duplicate messages in total")
+        conn.close()
+        
+        return total_folders, total_messages
+        
+    except Exception as e:
+        print_error(f"Error processing database for combined output: {str(e)}")
+        return 0, 0
+
+def analyze_email_dates(db_path):
+    """Analyze and report on date ranges in the database"""
+    try:
+        account_name = os.path.basename(os.path.dirname(db_path))
+        print_subheader(f"Analyzing email dates for {YELLOW}{account_name}{RESET}")
+        conn = sqlite3.connect(db_path, timeout=60.0)
+        cursor = conn.cursor()
+        
+        # Get min and max dates
+        cursor.execute("SELECT MIN(date_time_t), MAX(date_time_t) FROM MessageTable WHERE date_time_t IS NOT NULL")
+        min_date, max_date = cursor.fetchone()
+        
+        if min_date and max_date:
+            min_date_str = datetime.fromtimestamp(min_date).strftime('%Y-%m-%d')
+            max_date_str = datetime.fromtimestamp(max_date).strftime('%Y-%m-%d')
+            print_info(f"📅 Date range: {BRIGHT_CYAN}{min_date_str}{RESET} to {BRIGHT_CYAN}{max_date_str}{RESET}")
+            
+            # Get date distribution by year
+            cursor.execute("""
+                SELECT 
+                    strftime('%Y', datetime(date_time_t, 'unixepoch')) as year,
+                    COUNT(*) as count
+                FROM MessageTable
+                WHERE date_time_t IS NOT NULL
+                GROUP BY year
+                ORDER BY year
+            """)
+            
+            year_counts = cursor.fetchall()
+            if year_counts:
+                print_info("📊 Email counts by year:")
+                for year, count in year_counts:
+                    year_color = BRIGHT_YELLOW if int(year) >= datetime.now().year - 1 else BRIGHT_BLUE
+                    print_detail(f"{year_color}{year}{RESET}: {BRIGHT_GREEN}{count}{RESET} messages", level=2)
+        else:
+            print_warning("No date information found in message database")
+            
+        conn.close()
+    except Exception as e:
+        print_error(f"Error analyzing dates: {e}")
+
+def import_to_claws_mail(mbox_dir, claws_parent_folder=None, combined_path=None):
+    """Import mbox files directly to Claws Mail"""
+    print_header("Importing to Claws Mail", "=", BRIGHT_MAGENTA)
+    
+    # Determine Claws Mail directory
+    claws_mail_dir = os.path.expanduser("~/Mail")
+    if not os.path.exists(claws_mail_dir):
+        print_error(f"Claws Mail directory not found: {claws_mail_dir}")
+        return False
+
+    # Check if Claws Mail is running
+    try:
+        import subprocess
+        result = subprocess.run(["pgrep", "-x", "claws-mail"], capture_output=True)
+        if result.returncode == 0:
+            print_error(f"{BOLD}Please close Claws Mail before importing.{RESET}")
+            return False
+    except:
+        print_warning("Could not check if Claws Mail is running. Proceeding anyway.")
+    
+    # Set up parent folder
+    if not claws_parent_folder:
+        claws_parent_folder = "Imported_" + datetime.now().strftime("%Y%m%d")
+    
+    parent_path = os.path.join(claws_mail_dir, claws_parent_folder)
+    os.makedirs(parent_path, exist_ok=True)
+    print_info(f"Created Claws Mail folder: {BRIGHT_CYAN}{parent_path}{RESET}")
+    
+    # Special handling for combined mbox
+    if combined_path and os.path.exists(combined_path):
+        print_info(f"Importing combined mbox: {BRIGHT_CYAN}{combined_path}{RESET}")
+        
+        # Create a single folder for combined mbox
+        folder_name = "All_Mail"
+        folder_path = os.path.join(parent_path, folder_name)
+        os.makedirs(folder_path, exist_ok=True)
+        
+        # Copy combined mbox as inbox
+        target_path = os.path.join(folder_path, "inbox")
+        shutil.copy2(combined_path, target_path)
+        
+        # Create Claws Mail metadata
+        with open(os.path.join(folder_path, ".mh_sequences"), 'w') as f:
+            f.write("s0\n")
+            
+        with open(os.path.join(folder_path, ".claws_mailmbox"), 'w') as f:
+            pass
+            
+        print_success(f"Imported combined mbox to Claws Mail under {BRIGHT_CYAN}{claws_parent_folder}/{folder_name}{RESET}")
+        
+        print_subheader("Next Steps", BRIGHT_GREEN)
+        print_info("To see these folders in Claws Mail:")
+        print_detail(f"1. Start Claws Mail", level=1)
+        print_detail(f"2. Right-click on 'Mailboxes' in the folder tree", level=1)
+        print_detail(f"3. Select 'Check for new folders'", level=1)
+        
+        return True
+        
+    # Normal processing for multiple mbox files
+    mbox_files = [f for f in os.listdir(mbox_dir) if f.endswith('.mbox')]
+    print_info(f"Found {BRIGHT_YELLOW}{len(mbox_files)}{RESET} mbox files to import")
+    
+    if not mbox_files:
+        print_warning("No mbox files found to import")
+        return False
+    
+    # Process each mbox file
+    count = 0
+    print_progress(0, len(mbox_files), prefix="Importing", suffix="")
+    
+    for i, mbox_file in enumerate(mbox_files):
+        # Extract folder name
+        folder_name = os.path.splitext(mbox_file)[0]
+        sanitized_name = re.sub(r'[^a-zA-Z0-9_-]', '_', folder_name)
+        
+        # Create folder
+        folder_path = os.path.join(parent_path, sanitized_name)
+        os.makedirs(folder_path, exist_ok=True)
+        
+        # Copy mbox content as inbox file
+        source_path = os.path.join(mbox_dir, mbox_file)
+        target_path = os.path.join(folder_path, "inbox")
+        shutil.copy2(source_path, target_path)
+        
+        # Create Claws Mail metadata file
+        with open(os.path.join(folder_path, ".mh_sequences"), 'w') as f:
+            f.write("s0\n")
+        
+        # Create folder marker
+        with open(os.path.join(folder_path, ".claws_mailmbox"), 'w') as f:
+            pass
+        
+        count += 1
+        print_progress(count, len(mbox_files), prefix="Importing to Claws Mail", suffix="")
+    
+    print_success(f"Import complete! {BRIGHT_GREEN}{count}{RESET} folders imported to Claws Mail under {BRIGHT_CYAN}{claws_parent_folder}{RESET}")
+    
+    print_subheader("Next Steps", BRIGHT_GREEN)
+    print_info("To see these folders in Claws Mail:")
+    print_detail(f"1. Start Claws Mail", level=1)
+    print_detail(f"2. Right-click on 'Mailboxes' in the folder tree", level=1)
+    print_detail(f"3. Select 'Check for new folders'", level=1)
+    
+    return True
+
+def main():
+    """Main program"""
+    # Create a simple but colorful banner
+    banner = f"""
+{BRIGHT_YELLOW}⚡ {BRIGHT_CYAN}GEARY{BRIGHT_GREEN}2{BRIGHT_BLUE}MBOX {BRIGHT_MAGENTA}v2.0 {BRIGHT_YELLOW}⚡{RESET}
+{BRIGHT_BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━{RESET}
+"""
+
+    parser = argparse.ArgumentParser(
+        description=f"Convert Geary emails to mbox format",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+{BRIGHT_CYAN}Examples:{RESET}
+  {BRIGHT_YELLOW}# Show this help message{RESET}
+  geary2mbox --help
+  
+  {BRIGHT_YELLOW}# Process and convert emails to separate mbox files{RESET}
+  geary2mbox --process
+  
+  {BRIGHT_YELLOW}# Convert to a single combined mbox file{RESET}
+  geary2mbox --process --combined
+  
+  {BRIGHT_YELLOW}# Convert and import directly to Claws Mail{RESET}
+  geary2mbox --process --claws-mail
+  
+  {BRIGHT_YELLOW}# Convert to combined mbox file with custom paths{RESET}
+  geary2mbox --process --combined --input ~/.local/share/geary --output ~/Mail/export
+"""
+    )
+    
+    parser.add_argument("--output", "-o", default="~/Documents/Mail/mbox",
+                        help="Output directory for mbox files")
+    parser.add_argument("--input", "-i", default="~/.local/share/geary",
+                        help="Input Geary data directory")
+    parser.add_argument("--combined", "-c", action="store_true",
+                        help="Combine all emails into a single mbox file")
+    parser.add_argument("--no-dedupe", action="store_true",
+                        help="Disable message deduplication (with --combined)")
+    parser.add_argument("--date-info", action="store_true",
+                        help="Show date information during processing")
+    parser.add_argument("--claws-mail", action="store_true",
+                        help="Import directly to Claws Mail after conversion")
+    parser.add_argument("--claws-folder", default=None,
+                        help="Parent folder name for Claws Mail import (default: Imported_YYYYMMDD)")
+    parser.add_argument("--quiet", "-q", action="store_true",
+                        help="Minimize output, show only important messages")
+    parser.add_argument("--process", "-p", action="store_true",
+                        help="Process and convert emails (required for actual conversion)")
+    
+    args = parser.parse_args()
+    
+    # Set quiet mode globally
+    global QUIET_MODE
+    QUIET_MODE = args.quiet
+    
+    if not QUIET_MODE:
+        print(banner)
+    
+    # Show help and exit if no processing was requested
+    if not args.process:
+        parser.print_help()
+        print_info(f"\nAdd {BRIGHT_GREEN}--process{RESET} flag to actually convert emails")
+        return 0
+    
+    # Expand paths
+    input_dir = os.path.expanduser(args.input)
+    output_dir = os.path.expanduser(args.output)
+    
+    # Check that input exists
+    if not os.path.exists(input_dir):
+        print_error(f"Input directory not found: {input_dir}")
+        return 1
+        
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    print_header("Starting Geary to Mbox Conversion", "*")
+    print_info(f"Input directory:  {BRIGHT_BLUE}{input_dir}{RESET}")
+    print_info(f"Output directory: {BRIGHT_BLUE}{output_dir}{RESET}")
+    
+    # Set up combined mbox path if needed
+    combined_path = None
+    if args.combined:
+        combined_path = os.path.join(output_dir, "all_mail.mbox")
+        print_info(f"Combined mode: All emails will be saved to {BRIGHT_CYAN}{combined_path}{RESET}")
+        if args.no_dedupe:
+            print_warning("Deduplication DISABLED - all message copies will be included")
+    
+    # Find Geary databases
+    db_files = []
+    for entry in os.listdir(input_dir):
+        if entry.startswith("goa_account_"):
+            account_dir = os.path.join(input_dir, entry)
+            if os.path.isdir(account_dir):
+                db_path = os.path.join(account_dir, "geary.db")
+                if os.path.exists(db_path):
+                    db_files.append(db_path)
+                    
+    if not db_files:
+        print_error(f"No Geary databases found in {input_dir}")
+        return 1
+        
+    print_success(f"Found {BRIGHT_YELLOW}{len(db_files)}{RESET} Geary account databases")
+    
+    # Process each database
+    total_folders = 0
+    total_messages = 0
+    
+    # For combined mode, track processed message IDs to avoid duplicates (unless disabled)
+    processed_ids = None if args.no_dedupe else (set() if args.combined else None)
+    
+    for db_file in db_files:
+        # First, analyze date ranges in the database
+        if args.date_info:
+            analyze_email_dates(db_file)
+            
+        if args.combined:
+            folders, messages = process_database_combined(db_file, output_dir, combined_path, processed_ids)
+        else:
+            # Create an account-specific subdirectory
+            account_name = os.path.basename(os.path.dirname(db_file))
+            account_output_dir = os.path.join(output_dir, account_name)
+            os.makedirs(account_output_dir, exist_ok=True)
+            
+            folders, messages = process_database(db_file, account_output_dir)
+        total_folders += folders
+        total_messages += messages
+    
+    # Final summary
+    print_header("Conversion Summary", "=", BRIGHT_GREEN)
+    print_success(f"Conversion complete!")
+    
+    if args.combined:
+        print_success(f"All {BRIGHT_GREEN}{total_messages}{RESET} messages from {BRIGHT_YELLOW}{total_folders}{RESET} folders saved to: {BRIGHT_CYAN}{combined_path}{RESET}")
+    else:
+        print_success(f"Total folders processed: {BRIGHT_YELLOW}{total_folders}{RESET}")
+        print_success(f"Total messages converted: {BRIGHT_GREEN}{total_messages}{RESET}")
+        print_info(f"Mbox files saved to: {BRIGHT_CYAN}{output_dir}{RESET}")
+    
+    # Import to Claws Mail if requested
+    if args.claws_mail:
+        if args.combined:
+            import_to_claws_mail(output_dir, args.claws_folder, combined_path)
+        else:
+            import_to_claws_mail(output_dir, args.claws_folder)
+    
+    return 0
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print_warning("Interrupted by user")
+        sys.exit(130)
+    except Exception as e:
+        print_error(f"Unexpected error: {str(e)}")
+        import traceback
+        print_error(traceback.format_exc())
+        sys.exit(1)
